@@ -5,6 +5,8 @@ A script to (re)launch pre-defined LXC containers.
 
 This is designed for personal use to do the heavy lifting for launching remote desktops from headless servers, but other types of systems can of course be launched as well (see the amuled server container).
 
+![Screenshot](screenshot.png)
+
 I use [Chrome Remote Desktop](https://remotedesktop.google.com/) to provide remote desktop access for convenience sake, but you could also use VNC, XRDP, X2Go, etc.
 
 Note: Your security requirements are probably different from mine. I don't recommend using this script in production!

@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+#
+# A script to (re)launch pre-defined LXC containers.
+# I use this mainly for launching remote desktop containers on headless servers, but it can be used to launch any kind.
+#
+# Requirements:
+#   * A Linux host
+#   * LXD (https://linuxcontainers.org/lxd/introduction/)
+#
+# Usage:
+#   * Define your machine launchers (see section: My Machines)
+#   * Add your machines to MACHINES (see bottom of file)
+#   * lxc-launch your-machine
+#
+# Notes:
+#   * lxc-launch will destroy any existing container of the same name, but host-mounted directories will be untouched.
+#     Use host-mounted directories for persistent data.
+#
+#   * In-container uid mapping to a host user requires adding entries to your hostside /etc/subuid and /etc/subgid:
+#     root:<host user gid/uid>:1
+#     Example: root:1000:1
+#
+#   * The initial password for the admin user is the same as the username (see function add_basic_user).
+#
+#
+# Desktop Environment:
+#
+# Desktops use the Mate desktop environment because it's very fast when software rendered, and has a small footprint.
+# Other environments are possible (LXDE, KDE, Budgie, etc) but would need further testing.
+#
+#
+# Network Bridge:
+#
+# I find it helpful to bridge the containers directly to your local net so that they can be accessed like a full machine.
+#
+# Note: WIFI bridging is problematic: https://wiki.debian.org/BridgeNetworkConnections#Bridging_with_a_wireless_NIC
+#
+# Examples (replace eth0 with your actual ethernet interface):
+#
+# Netplan: /etc/netplan/01-with-bridge.yaml:
+#     bridges:
+#         br0:
+#           interfaces: [eth0]
+#           dhcp4: true
+#           parameters:
+#             stp: false
+#             forward-delay: 0
+#
+# NixOS:
+#     networking = {
+#       bridges.br0.interfaces = [ "eth0" ];
+#       useDHCP = false;
+#       interfaces = {
+#         eth0.useDHCP = false;
+#         br0.useDHCP = true;
+#       };
+#     };
+#     virtualisation.lxd.enable = true;
+#     virtualisation.libvirtd = {
+#       enable = true;
+#       allowedBridges = [ "br0" "virbr0" ];
+#     };
+
+
+import hashlib
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+import uuid
+
+
+CONTAINER_PERSISTENT_DATA = "/home/data"    # Place to store persistent data in the form container-name/somedir
+                                            # Desktop home dirs will be put here by default.
+
+DEFAULT_HOSTSIDE_USER     = "karl"          # Map the container admin user to this host user when mounting host file systems
+DEFAULT_ADMIN_USER        = "karl"          # Admin user to create inside the container (or None)
+DEFAULT_BRIDGE            = "br0"           # Set to None if you don't have a custom bridge
+DEFAULT_TIME_ZONE         = "Europe/Berlin" # The container's time zone
+DEFAULT_LANGUAGE          = "en"            # Language (localization)
+DEFAULT_REGION            = "US"            # Region (localization)
+DEFAULT_KEYBOARD_LAYOUT   = "us"            # Keyboard layout
+DEFAULT_KEYBOARD_MODEL    = "pc105"         # Keyboard model
+
+VERSION_GOLANG            = "1.18.1"        # Used by install_golang
+VERSION_RUST              = "1.60.0"        # Used by install_rust
+
+
+# =============================================================================
+
+# Guests handle all operations that must be run inside the container.
+
+class LinuxGuest:
+	def __init__(self, image_name, container_name, admin_user):
+		self.container_name = container_name
+		self.image_name = image_name
+		self.admin_user = admin_user
+
+	def status_message(self, message):
+		print("Machine \"" + self.container_name + "\": " + str(message))
+
+	def generate_temp_filename(self):
+		return os.path.join("/tmp", str(uuid.uuid4()))
+
+	def delete(self):
+		subprocess.run(["lxc", "delete", "-f", self.container_name], stderr=subprocess.DEVNULL)
+
+	def init(self):
+		subprocess.run(["lxc", "init", self.image_name, self.container_name], check=True)
+
+	def start(self):
+		subprocess.run(["lxc", "start", self.container_name], check=True)
+
+	def stop(self):
+		subprocess.run(["lxc", "stop", "--timeout", "20", self.container_name])
+
+	def restart(self):
+		self.stop()
+		self.start()
+		self.wait_for_network()
+
+	def config(self, args):
+		subprocess.run(["lxc", "config"] + args, check=True)
+
+	def config_get(self, key):
+		return subprocess.check_output(["lxc", "config", "get", self.container_name, key]).decode("utf-8")
+
+	def config_set(self, key, value):
+		self.config(["set", self.container_name, key, value])
+
+	def write(self, guest_path, contents, string=False):
+		p = subprocess.Popen(["lxc", "exec", self.container_name, "--", "tee", guest_path], stdout=subprocess.DEVNULL, stdin=subprocess.PIPE)
+		p.communicate(input=bytes(contents, "utf-8") if string else contents)
+
+	def exec(self, args, check=True):
+		subprocess.run(["lxc", "exec", self.container_name, "--"] + args, check=check)
+
+	def exec_output(self, args, string=False):
+		result = subprocess.check_output(["lxc", "exec", self.container_name, "--"] + args)
+		return result.decode("utf-8") if string else result
+
+	def exec_input(self, input_contents, args, string=False):
+		p = subprocess.Popen(["lxc", "exec", self.container_name, "--"] + args, stdin=subprocess.PIPE)
+		p.communicate(input=bytes(input_contents, "utf-8") if string else input_contents)
+
+	def exec_io(self, input_contents, args, instring=False, outstring=False):
+		p = subprocess.Popen(["lxc", "exec", self.container_name, "--"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+		p.stdin.write(bytes(input_contents, "utf-8") if instring else input_contents)
+		p.stdin.close()
+		result = p.stdout.read()
+		return result.decode("utf-8") if outstring else result
+
+	def exec_script(self, script_contents):
+		path = self.generate_temp_filename() + ".sh"
+		self.write(path, script_contents, string=True)
+		self.exec(["bash", path])
+		self.rm(path)
+
+	def is_network_up(self):
+		return '\t0003\t' in self.exec_output(["cat", "/proc/net/route"], string=True)
+
+	def wait_for_network(self):
+		while not self.is_network_up():
+			self.status_message("Waiting for network")
+			time.sleep(1)
+		time.sleep(0.5)
+
+	def allow_nesting(self):
+		self.config_set("security.nesting", "true")
+
+	def mark_privileged(self):
+		self.config_set("security.privileged", "true")
+
+	def set_mac_address(self, mac_addr):
+		self.config_set("volatile.eth0.hwaddr", mac_addr)
+
+	def use_bridge(self, bridge):
+		self.config(["device", "add", self.container_name, "eth0", "nic", "nictype=bridged", "parent="+bridge, "name=eth0"])
+
+	def mkdir(self, path):
+		self.exec(["mkdir", "-p", path])
+
+	def rm(self, path):
+		self.exec(["rm", "-rf", path])
+
+	def copy_host_fs_to_guest(self, host_path, guest_path):
+		# tar cf - . | lxc exec $container_name -- tar xf - --no-same-owner -C "$dstdir"
+		self.exec(["mkdir", "-p", guest_path])
+		p = subprocess.Popen(["lxc", "exec", self.container_name, "--", "tar", "-C", guest_path, "-xf", "-"], stdin=subprocess.PIPE)
+		with tarfile.open("ignored.tar", 'w|', fileobj=p.stdin) as archive_fd:
+			for f in os.listdir(host_path):
+				archive_fd.add(os.path.join(host_path, f), arcname=f)
+		p.wait()
+
+	def read_from_url(self, url, string=False):
+		with urllib.request.urlopen(url) as response:
+			return response.read().decode('utf-8') if string else response.read()
+
+	def download_url(self, url, filename_suffix=""):
+		guest_path = self.generate_temp_filename() + filename_suffix
+		self.write(guest_path, self.read_from_url(url))
+		return guest_path
+
+	def untar_url(self, url, guest_path):
+		self.status_message("Extracting " + url + " to " + guest_path)
+		self.mkdir(guest_path)
+		self.exec_input(self.read_from_url(url), ["tar", "-C", guest_path, "-xzf", "-"])
+
+	def download_extract_run(self, url, run_command):
+		temp_dir = self.generate_temp_filename()
+		self.mkdir(temp_dir)
+		self.untar_url(url, temp_dir)
+		self.status_message("Running " + run_command)
+		self.exec([os.path.join(temp_dir, run_command)])
+		self.rm(temp_dir)
+
+	def add_user_to_groups(self, user, groups):
+		for group in groups:
+			self.exec(["usermod", "-a", "-G", group, user])
+
+	def add_basic_user(self, name, home_dir):
+		self.exec(["useradd", "--create-home", "--home-dir", home_dir, "--shell", "/bin/bash", "--user-group", name])
+		group = self.exec_output(["id", "-g", name], string=True).strip()
+		self.exec_input(name+":"+name, ["chpasswd"], string=True)
+		self.exec(["chown", "-R", name+":"+group, home_dir])
+
+	def add_admin_user(self, name):
+		home_dir = "/home/"+name
+		self.add_basic_user(name, "/home/"+name)
+		self.add_user_to_groups(name, ["adm", "sudo"])
+
+	def set_locale(self, language=DEFAULT_LANGUAGE, region=DEFAULT_REGION, kb_layout=DEFAULT_KEYBOARD_LAYOUT, kb_model=DEFAULT_KEYBOARD_MODEL):
+		# Example: "en", "US", "us", "pc105"
+		lang_base=language+"_"+region
+		lang_full=lang_base+".UTF-8"
+		self.exec_input("keyboard-configuration keyboard-configuration/layoutcode string {}\n"
+			"keyboard-configuration keyboard-configuration/modelcode string {}"
+			.format(kb_layout, kb_model), ["debconf-set-selections"], string=True)
+		self.exec(["locale-gen", lang_base, lang_full])
+		self.exec(["update-locale", "LANG="+lang_full, "LANGUAGE="+lang_base+":"+language, "LC_ALL="+lang_full])
+
+	def set_timezone(self, timezone):
+		# Example: "America/Vancouver"
+		self.exec(["timedatectl", "set-timezone", timezone])
+
+	def setup_id_map(self, guest_user, guest_group, host_user, host_group):
+		uid_gid_map = "uid {} {}\ngid {} {}".format(host_user, guest_user, host_group, guest_group)
+		self.config_set("raw.idmap", uid_gid_map)
+
+	def sed(self, file, command):
+		self.exec(["sed", "-i", command, file])
+
+	def mount_host_fs(self, mount_name, user_name, host_path, guest_path):
+		self.exec(["mkdir", "-p", guest_path])
+		self.config(["device", "add", self.container_name, mount_name, "disk", "source="+host_path, "path="+guest_path])
+
+# -----------------------------------------------------------------------------
+
+class DebianGuest(LinuxGuest):
+
+	def __init__(self, image_name, container_name, admin_user):
+		super().__init__(image_name, container_name, admin_user)
+
+	def apt(self, command):
+		self.exec(["bash", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get " + command])
+
+	def apt_update(self):
+		self.apt("update")
+
+	def apt_upgrade(self):
+		self.apt("dist-upgrade -y")
+
+	def apt_autoremove(self):
+		self.apt("autoremove -y")
+
+	def apt_remove(self, packages):
+		self.apt("remove -y " + ' '.join(packages))
+
+	def apt_purge(self, packages):
+		self.apt("purge -y " + ' '.join(packages))
+
+	def apt_install(self, packages):
+		self.apt("install -y " + ' '.join(packages))
+
+	def apt_add_repository(self, ppa):
+		self.exec(["add-apt-repository", "-y", ppa])
+
+	def apt_add_signed_repository(self, name, key_location, repo_location, repo_type):
+		self.install_gpg_key(key_location, "/usr/share/keyrings/" + name + "-archive-keyring.gpg")
+		self.write("/etc/apt/sources.list.d/" + name + ".list",
+			"deb [signed-by=/usr/share/keyrings/" + name + "-archive-keyring.gpg] " + repo_location + " " + repo_type,
+			string=True)
+		self.apt_update()
+
+	def apt_install_urls(self, urls):
+		for url in urls:
+			self.status_message("Installing deb from url " + url)
+			guest_path = self.download_url(url, ".deb")
+			self.apt_install(([guest_path]))
+			self.rm(guest_path)
+
+	def install_gpg_key(self, key_location, dest_file):
+		key = self.read_from_url(key_location)
+		key = self.exec_io(key, ["gpg","--dearmor"])
+		self.write(dest_file, key)
+
+	def snap_install(self, packages):
+		for package in packages:
+			if ":" in package:
+				fields = package.split(":")
+				self.exec(["snap", "install", fields[0], "--" + fields[1]])
+			else:
+				self.exec(["snap", "install", package])
+
+	def disable_services(self, services):
+		for service in services:
+			self.exec(["systemctl", "disable", service], check=False)
+
+	def restart_services(self, services):
+		for service in services:
+			self.exec(["systemctl", "restart", service])
+
+	def enable_password_ssh(self):
+		self.apt_install(["openssh-server"])
+		self.sed("/etc/ssh/sshd_config", "s/PasswordAuthentication no/PasswordAuthentication yes/g")
+
+	def apply_fix_bluetooth(self):
+		# Ubuntu 18.04: Force bluetooth to install and then disable it so that it doesn't break the desktop install.
+		self.apt_install(["bluez"])
+		self.exec(["systemctl", "disable", "bluetooth"])
+		self.exec(["apt-get", "install", "-y"])
+
+	def install_crd(self):
+		self.apt_install_urls(["https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
+			"https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb"])
+
+	def mesage_crd(self):
+		self.status_message("To finish setting up Chrome Remote Desktop:")
+		self.status_message(" * Go to https://remotedesktop.google.com/headless")
+		self.status_message(" * Authorize for Debian Linux and copy the resulting command.")
+		self.status_message(" * Open a root shell in your container: lxc exec " + self.container_name + " bash")
+		self.status_message(" * Switch to the container's desktop user: su - " + self.admin_user)
+		self.status_message(" * Paste the authorize command you copied earlier into the shell.")
+
+	def install_deb_firefox(self):
+		self.apt_add_repository("ppa:mozillateam/ppa")
+		self.apt_install(["firefox-esr"])
+
+	def install_deb_sublime_text(self):
+		self.apt_add_signed_repository("sublimetext",
+			"https://download.sublimetext.com/sublimehq-pub.gpg",
+			"https://download.sublimetext.com/",
+			"apt/stable/")
+		self.apt_install(["sublime-text"])
+
+	def install_snap_sublime_text(self):
+		self.snap_install(["sublime-text:classic"])
+
+	def install_visual_studio_code(self):
+		# https://code.visualstudio.com/download#
+		self.apt_install_urls(["https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64"])
+
+	def install_golang(self):
+		# https://go.dev/doc/install
+		self.untar_url("https://go.dev/dl/go" + VERSION_GOLANG + ".linux-amd64.tar.gz", "/usr/local")
+		self.write("/etc/profile.d/golang.sh", "export PATH=$PATH:/usr/local/go/bin\n", string=True)
+
+	def install_rust(self):
+		# https://forge.rust-lang.org/infra/other-installation-methods.html#standalone-installers
+		self.download_extract_run("https://static.rust-lang.org/dist/rust-" + VERSION_RUST + "-x86_64-unknown-linux-gnu.tar.gz",
+			"rust-" + VERSION_RUST + "-x86_64-unknown-linux-gnu/install.sh")
+
+	def install_basic(self):
+		self.apt_install([
+			"bridge-utils",
+			"debconf",
+			"git",
+			"gnupg",
+			"locales",
+			"net-tools",
+			"nmap",
+			"openssh-server",
+			"software-properties-common",
+			"telnet",
+			"tree",
+			"tzdata",
+			"unrar-free",
+			"unzip",
+		])
+		self.disable_services([
+			"accounts-daemon",
+		])
+
+	def install_desktop(self):
+		self.apply_fix_bluetooth()
+		self.install_basic()
+		self.apt_install([
+			"mate-desktop-environment",
+			"mate-themes",
+			"mate-tweak",
+			"avahi-daemon", # Needed for SMB browsing (workaround for gvfs bug)
+			"firefox-esr",
+			"vlc",
+		])
+		self.disable_services([
+			"unattended-upgrades",
+		])
+		self.install_crd()
+
+# -----------------------------------------------------------------------------
+
+class UbuntuGuest(DebianGuest):
+
+	def __init__(self, image_name, container_name, admin_user):
+		super().__init__(image_name, container_name, admin_user)
+
+	def apply_fix_remove_snapd(self):
+		# Ubuntu 21.10: snapd gets stuck at: snapd.snap-repair.service is a disabled or a static unit, not starting it.
+		self.apt_purge(["snapd"])
+		self.exec(["dpkg", "--configure", "-a"])
+
+	def apply_fix_add_snapd(self):
+		self.apt_install(["snapd"])
+
+	def apply_fix_block_acpi_support(self):
+		# Ubuntu 21.04: ACPI installation hangs
+		self.exec(["apt-mark", "hold", "acpi-support"])
+
+	def apply_fix_fail_install_snapd(self):
+		# First snap install fails: https://bugs.launchpad.net/snapd/+bug/1712808
+		# exec(["snap", "install", "snapd"], check=False)
+		self.exec(["snap", "install", "hello-world"], check=False)
+
+	def add_basic_user(self, name, home_dir):
+		# Ubuntu images come with a preinstalled "ubuntu" user
+		if name != "ubuntu":
+			self.exec(["userdel", "-r", "ubuntu"])
+			super().add_basic_user(name, home_dir)
+
+	def install_basic(self):
+		self.apt_install([
+			"bridge-utils",
+			"debconf",
+			"git",
+			"locales",
+			"net-tools",
+			"nmap",
+			"software-properties-common",
+			"telnet",
+			"tree",
+			"tzdata",
+			"unrar",
+			"unzip",
+		])
+		self.disable_services([
+			"accounts-daemon",
+		])
+
+	def install_desktop(self):
+		self.apply_fix_bluetooth()
+		self.install_basic()
+		self.apt_install([
+			"ubuntu-mate-desktop",
+			"vlc",
+		])
+		self.apt_remove(["light-locker"])
+		self.disable_services([
+			"apport",
+			"cpufrequtils",
+			"hddtemp",
+			"lm-sensors",
+			"network-manager",
+			"speech-dispatcher",
+			"ufw",
+			"unattended-upgrades",
+		])
+		self.install_crd()
+		self.install_deb_firefox()
+
+
+# =============================================================================
+
+# Launchers launch containers and coordinate their installation.
+
+class LinuxLauncher:
+
+	# image_name:     The name of the LXC image to install (ubuntu-daily:22.04, images:debian/11, etc).
+	# container_name: What to name this container.
+	# mac_addr:       A custom mac address to use, or None to get a random one.
+	# bridge:         The network bridge to attach to, or None for the default.
+	# time_zone:      The time zone (America/Vancouver, Europe/Berlin, etc).
+	# admin_user:     The admin user to create inside the container, or None.
+	# hostside_user:  The user on the host that will own any host-mounted directories.
+	def __init__(self, image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user):
+		self.container_name = container_name
+		self.image_name = image_name
+		self.mac_addr = mac_addr
+		self.bridge = bridge
+		self.time_zone = time_zone
+		self.admin_user = admin_user
+		self.hostside_user = hostside_user
+		self.guest = LinuxGuest(image_name, container_name, admin_user)
+
+	def status_message(self, message):
+		self.guest.status_message(message)
+
+	def md5_hash(self, string):
+		return hashlib.md5(string.encode('utf-8')).hexdigest()
+
+	def chown(self, user, path):
+		group = subprocess.check_output(["id", "-g", user]).decode("utf-8").strip()
+		subprocess.run(["mkdir", "-p", path], check=True)
+		subprocess.run(["chown", "-R", user+":"+group, path], check=True)
+
+	def has_subugid(self, file_path, user, id):
+		with open(file_path) as file:
+			for line in file:
+				fields = line.split(':')
+				host_user = fields[0]
+				subid = int(fields[1])
+				# length = fields[2]
+				if host_user == user and subid == id:
+					return True
+		return False
+
+	def validate_uid_gid_map(self, uid, gid):
+		user = "root"
+		if not (self.has_subugid("/etc/subuid", user, uid) and self.has_subugid("/etc/subgid", user, gid)):
+			raise Exception("UID or GID map not configured properly. /etc/subuid must have entry {}:{}:1 and /etc/subgid must have entry {}:{}:1"
+				.format(user, uid, user, gid))
+
+	def mount_host_fs(self, mount_name, user_name, host_path, guest_path, chown_host=False):
+		if chown_host:
+			self.chown(user_name, host_path)
+		self.guest.mount_host_fs(mount_name, user_name, host_path, guest_path)
+
+	def mount_homedir_on_host(self):
+		host_mount = CONTAINER_PERSISTENT_DATA + "/" + self.container_name
+		self.mount_host_fs("home", self.admin_user, host_mount+"/"+self.admin_user, "/home/"+self.admin_user, chown_host=True)
+
+	def launch_basic(self, privileged=False, nesting=False):
+		pwnam = pwd.getpwnam(self.hostside_user)
+		host_uid = pwnam.pw_uid
+		host_gid = pwnam.pw_gid
+		guest_uid = 1000
+		guest_gid = 1000
+
+		self.validate_uid_gid_map(host_uid, host_gid)
+
+		self.status_message("Launching new container from " + self.image_name)
+		self.guest.delete()
+		self.guest.init()
+		if privileged:
+			self.guest.mark_privileged()
+		if nesting:
+			self.guest.allow_nesting()
+		if self.mac_addr:
+			self.guest.set_mac_address(self.mac_addr)
+		if self.bridge:
+			self.guest.use_bridge(self.bridge)
+		self.guest.setup_id_map(guest_uid, guest_gid, host_uid, host_gid)
+		time.sleep(1)
+		self.guest.start()
+		self.guest.wait_for_network()
+		if self.admin_user:
+			self.guest.add_admin_user(self.admin_user)
+
+# -----------------------------------------------------------------------------
+
+class DebianLauncher(LinuxLauncher):
+
+	def __init__(self, image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user):
+		super().__init__(image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user)
+		self.guest = DebianGuest(image_name, container_name, admin_user)
+
+	def launch_basic(self, privileged=False, nesting=False):
+		super().launch_basic(privileged, nesting)
+		self.guest.apt_update()
+		self.guest.install_basic()
+		self.guest.set_locale()
+		self.guest.set_timezone(self.time_zone)
+		self.guest.apt_upgrade()
+		self.guest.apt_autoremove()
+
+	def launch_desktop(self):
+		self.launch_basic(privileged=True, nesting=True)
+		self.mount_homedir_on_host()
+		self.guest.install_desktop()
+
+# -----------------------------------------------------------------------------
+
+class UbuntuLauncher(DebianLauncher):
+
+	def __init__(self, image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user):
+		super().__init__(image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user)
+		self.guest = UbuntuGuest(image_name, container_name, admin_user)
+
+	def launch_basic(self, privileged=False, nesting=False):
+		super().launch_basic(privileged, nesting)
+		self.guest.apply_fix_block_acpi_support()
+		self.guest.apply_fix_remove_snapd()
+		self.guest.apt_update()
+		self.guest.install_basic()
+		self.guest.set_locale()
+		self.guest.set_timezone(self.time_zone)
+		self.guest.apt_upgrade()
+		self.guest.apply_fix_add_snapd()
+		self.guest.apt_remove(["cloud-init"])
+		self.guest.apt_autoremove()
+
+
+# =============================================================================
+
+# Basic desktops to play around with
+
+class DebianStableDesktopLauncher(DebianLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:debian/11", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.mesage_crd()
+
+# -----------------------------------------------------------------------------
+
+class DebianUnstableDesktopLauncher(DebianLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:debian/sid", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.mesage_crd()
+
+# -----------------------------------------------------------------------------
+
+class UbuntuLTSDesktopLauncher(UbuntuLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("ubuntu-daily:22.04", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.mesage_crd()
+
+# -----------------------------------------------------------------------------
+
+class MintLMDEDesktopLauncher(UbuntuLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:mint/una", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.mesage_crd()
+
+# =============================================================================
+
+# My Machines
+
+class DevUbuntuLauncher(UbuntuLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("ubuntu-daily:22.04", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.enable_password_ssh()
+		self.guest.apt_install([
+			"antlr4",
+			"autoconf",
+			"autopkgtest",
+			"bison",
+			"build-essential",
+			"cmake",
+			"cpu-checker",
+			"curl",
+			"debconf-utils",
+			"devscripts",
+			"filezilla",
+			"flex",
+			"gdb",
+			"gvfs-bin",
+			"libtool",
+			"meld",
+			"meson",
+			"mtools",
+			"nasm",
+			"nfs-common",
+			"ninja-build",
+			"ovmf",
+			"pkg-config",
+			"python3-pip",
+			"python3-pytest",
+			"remmina",
+			"remmina",
+			"remmina-plugin-nx",
+			"remmina-plugin-spice",
+			"rsnapshot",
+			"ubuntu-dev-tools",
+			])
+		self.guest.install_deb_sublime_text()
+		self.guest.install_visual_studio_code()
+		self.guest.install_golang()
+		self.guest.install_rust()
+		self.guest.mesage_crd()
+
+class DevDebianLauncher(DebianLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:debian/11", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.enable_password_ssh()
+		self.guest.apt_install([
+			"antlr4",
+			"autoconf",
+			"autopkgtest",
+			"bison",
+			"build-essential",
+			"cmake",
+			"cpu-checker",
+			"curl",
+			"debconf-utils",
+			"devscripts",
+			"filezilla",
+			"flex",
+			"gdb",
+			"gvfs-bin",
+			"libtool",
+			"meld",
+			"meson",
+			"mtools",
+			"nasm",
+			"nfs-common",
+			"ninja-build",
+			"ovmf",
+			"pkg-config",
+			"python3-pip",
+			"python3-pytest",
+			"remmina",
+			"remmina-plugin-nx",
+			"remmina-plugin-spice",
+			"transmission-remote-gtk",
+		])
+		self.guest.install_deb_sublime_text()
+		self.guest.install_visual_studio_code()
+		self.guest.install_golang()
+		self.guest.install_rust()
+		self.guest.mesage_crd()
+
+# -----------------------------------------------------------------------------
+
+class BrowserUbuntuLauncher(UbuntuLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("ubuntu-daily:20.04", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.enable_password_ssh()
+		self.guest.apt_install([
+			"filezilla",
+			"remmina",
+			"transmission-remote-gtk",
+		])
+		self.guest.mesage_crd()
+
+class BrowserDebianLauncher(DebianLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:debian/11", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.enable_password_ssh()
+		self.guest.apt_install([
+			"amule-utils-gui",
+			"filezilla",
+			"mpv",
+			"remmina",
+			"remmina-plugin-nx",
+			"remmina-plugin-spice",
+			"transmission-remote-gtk",
+		])
+		self.guest.install_deb_sublime_text()
+		self.guest.mesage_crd()
+
+# -----------------------------------------------------------------------------
+
+class CRDDebianLauncher(DebianLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:debian/11", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.enable_password_ssh()
+		self.guest.apt_install([
+			"filezilla",
+			"remmina",
+			"remmina-plugin-nx",
+			"remmina-plugin-spice",
+		])
+		self.guest.install_deb_sublime_text()
+		self.guest.mesage_crd()
+
+# -----------------------------------------------------------------------------
+
+class AmuledLauncher(DebianLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:debian/11", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, None, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		host_mount = "/pool/Downloads/amule"
+		amule_user = "amule"
+		amule_home = "/amule"
+		amule_pw   = self.md5_hash("amule")
+
+		self.launch_basic()
+		self.mount_host_fs("home", self.hostside_user, host_mount, amule_home, chown_host=True)
+		self.guest.add_basic_user(amule_user, amule_home)
+		self.guest.apt_install(["amule-daemon"])
+		self.guest.sed("/etc/default/amule-daemon", 's/AMULED_USER=""/AMULED_USER="' + amule_user + '"/g')
+		self.guest.restart_services(["amule-daemon"])
+		self.guest.sed("/amule/.aMule/amule.conf", 's/AcceptExternalConnections=0/AcceptExternalConnections=1/g')
+		self.guest.sed("/amule/.aMule/amule.conf", 's/^ECPassword=$/ECPassword=' + amule_pw + '/g')
+		self.guest.sed("/amule/.aMule/amule.conf", 's/^Enabled=0/Enabled=1/g')
+		self.guest.sed("/amule/.aMule/amule.conf", 's/^Password=$/Password=' + amule_pw + '/g')
+		self.guest.restart_services(["amule-daemon"])
+
+# -----------------------------------------------------------------------------
+
+class TestLauncher(UbuntuLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("ubuntu-daily:22.04", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_desktop()
+		self.guest.enable_password_ssh()
+		self.guest.install_deb_sublime_text()
+		self.guest.install_visual_studio_code()
+		self.guest.install_golang()
+		self.guest.install_rust()
+		self.guest.mesage_crd()
+
+# =============================================================================
+
+# Main
+
+MACHINES = {
+	# Use None for the mac address to get a random one.
+	'crd':     CRDDebianLauncher(     "crd",  "12:4B:53:00:00:20" ),
+	'dev':     DevDebianLauncher(     "dev",  "12:4B:53:00:00:21" ),
+	'tx':      BrowserDebianLauncher( "tx",   "12:4B:53:00:00:22" ),
+	'mule':    AmuledLauncher(        "mule", "12:4B:53:00:00:23" ),
+	'test':    TestLauncher(          "test", "12:4B:53:00:00:29" ),
+}
+
+if len(sys.argv) != 2 or sys.argv[1] not in MACHINES:
+	print("Usage: " + sys.argv[0] + " <machine name>")
+	print("")
+	print("Available machines:")
+	for key in MACHINES:
+		print("    " + key)
+	sys.exit(1)
+
+machine = MACHINES[sys.argv[1]]
+machine.launch()

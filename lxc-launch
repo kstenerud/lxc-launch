@@ -258,6 +258,12 @@ class LinuxGuest:
 		self.exec(["mkdir", "-p", guest_path])
 		self.config(["device", "add", self.container_name, mount_name, "disk", "source="+host_path, "path="+guest_path])
 
+	def install_minimal(self):
+		pass
+
+	def install_basic(self):
+		pass
+
 # -----------------------------------------------------------------------------
 
 class DebianGuest(LinuxGuest):
@@ -285,6 +291,9 @@ class DebianGuest(LinuxGuest):
 
 	def apt_install(self, packages):
 		self.apt("install -y " + ' '.join(packages))
+
+	def apt_add_repository_component(self, component):
+		self.sed("/etc/apt/sources.list", "s/^\\(deb .*\\)$/\\1 " + component + "/g")
 
 	def apt_add_repository(self, ppa):
 		self.exec(["add-apt-repository", "-y", ppa])
@@ -374,7 +383,12 @@ class DebianGuest(LinuxGuest):
 		self.download_extract_run("https://static.rust-lang.org/dist/rust-" + VERSION_RUST + "-x86_64-unknown-linux-gnu.tar.gz",
 			"rust-" + VERSION_RUST + "-x86_64-unknown-linux-gnu/install.sh")
 
+	def install_minimal(self):
+		pass
+
 	def install_basic(self):
+		self.apt_add_repository_component("non-free")
+		self.apt_update()
 		self.apt_install([
 			"bridge-utils",
 			"debconf",
@@ -388,7 +402,7 @@ class DebianGuest(LinuxGuest):
 			"telnet",
 			"tree",
 			"tzdata",
-			"unrar-free",
+			"unrar",
 			"unzip",
 		])
 		self.disable_services([
@@ -441,7 +455,11 @@ class UbuntuGuest(DebianGuest):
 			self.exec(["userdel", "-r", "ubuntu"])
 			super().add_basic_user(name, home_dir)
 
+	def install_minimal(self):
+		pass
+
 	def install_basic(self):
+		self.apt_update()
 		self.apt_install([
 			"bridge-utils",
 			"debconf",
@@ -542,16 +560,17 @@ class LinuxLauncher:
 		host_mount = CONTAINER_PERSISTENT_DATA + "/" + self.container_name
 		self.mount_host_fs("home", self.admin_user, host_mount+"/"+self.admin_user, "/home/"+self.admin_user, chown_host=True)
 
-	def launch_basic(self, privileged=False, nesting=False):
-		pwnam = pwd.getpwnam(self.hostside_user)
-		host_uid = pwnam.pw_uid
-		host_gid = pwnam.pw_gid
-		guest_uid = 1000
-		guest_gid = 1000
-
-		self.validate_uid_gid_map(host_uid, host_gid)
-
+	def launch_minimal(self, privileged=False, nesting=False):
 		self.status_message("Launching new container from " + self.image_name)
+
+		if self.admin_user:
+			pwnam = pwd.getpwnam(self.hostside_user)
+			host_uid = pwnam.pw_uid
+			host_gid = pwnam.pw_gid
+			guest_uid = 1000
+			guest_gid = 1000
+			self.validate_uid_gid_map(host_uid, host_gid)
+
 		self.guest.delete()
 		self.guest.init()
 		if privileged:
@@ -562,12 +581,16 @@ class LinuxLauncher:
 			self.guest.set_mac_address(self.mac_addr)
 		if self.bridge:
 			self.guest.use_bridge(self.bridge)
-		self.guest.setup_id_map(guest_uid, guest_gid, host_uid, host_gid)
+		if self.admin_user:
+			self.guest.setup_id_map(guest_uid, guest_gid, host_uid, host_gid)
 		time.sleep(1)
 		self.guest.start()
 		self.guest.wait_for_network()
 		if self.admin_user:
 			self.guest.add_admin_user(self.admin_user)
+
+	def launch_basic(self, privileged=False, nesting=False):
+		self.launch_minimal(privileged, nesting)
 
 # -----------------------------------------------------------------------------
 
@@ -577,9 +600,11 @@ class DebianLauncher(LinuxLauncher):
 		super().__init__(image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user)
 		self.guest = DebianGuest(image_name, container_name, admin_user)
 
+	def launch_minimal(self, privileged=False, nesting=False):
+		super().launch_minimal(privileged, nesting)
+
 	def launch_basic(self, privileged=False, nesting=False):
 		super().launch_basic(privileged, nesting)
-		self.guest.apt_update()
 		self.guest.install_basic()
 		self.guest.set_locale()
 		self.guest.set_timezone(self.time_zone)
@@ -599,11 +624,13 @@ class UbuntuLauncher(DebianLauncher):
 		super().__init__(image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user)
 		self.guest = UbuntuGuest(image_name, container_name, admin_user)
 
+	def launch_minimal(self, privileged=False, nesting=False):
+		super().launch_minimal(privileged, nesting)
+
 	def launch_basic(self, privileged=False, nesting=False):
 		super().launch_basic(privileged, nesting)
 		self.guest.apply_fix_block_acpi_support()
 		self.guest.apply_fix_remove_snapd()
-		self.guest.apt_update()
 		self.guest.install_basic()
 		self.guest.set_locale()
 		self.guest.set_timezone(self.time_zone)
@@ -838,19 +865,13 @@ class AmuledLauncher(DebianLauncher):
 
 # -----------------------------------------------------------------------------
 
-class TestLauncher(UbuntuLauncher):
+class TestLauncher(DebianLauncher):
 
 	def __init__(self, container_name, mac_addr=None):
-		super().__init__("ubuntu-daily:22.04", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, DEFAULT_ADMIN_USER, DEFAULT_HOSTSIDE_USER)
+		super().__init__("images:debian/11", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, None, DEFAULT_HOSTSIDE_USER)
 
 	def launch(self):
-		self.launch_desktop()
-		self.guest.enable_password_ssh()
-		self.guest.install_deb_sublime_text()
-		self.guest.install_visual_studio_code()
-		self.guest.install_golang()
-		self.guest.install_rust()
-		self.guest.mesage_crd()
+		self.launch_basic()
 
 # =============================================================================
 

@@ -132,32 +132,65 @@ class LinuxGuest:
 	def config_set(self, key, value):
 		self.config(["set", self.container_name, key, value])
 
-	def write(self, guest_path, contents, string=False):
-		p = subprocess.Popen(["lxc", "exec", self.container_name, "--", "tee", guest_path], stdout=subprocess.DEVNULL, stdin=subprocess.PIPE)
+	def write_to_file(self, guest_path, contents, string=False, append=False, mode=None):
+		command = ["tee", "-a", guest_path] if append else ["tee", guest_path]
+		p = subprocess.Popen(["lxc", "exec", self.container_name, "--"] + command, stdout=subprocess.DEVNULL, stdin=subprocess.PIPE)
 		p.communicate(input=bytes(contents, "utf-8") if string else contents)
+		if mode:
+			self.chmod(guest_path, mode)
 
-	def exec(self, args, check=True):
+	def exec(self, args, check=True, run_path=None):
+		cwd = None
+		if run_path:
+			cwd = os.getcwd()
+			os.chdir(run_path)
 		subprocess.run(["lxc", "exec", self.container_name, "--"] + args, check=check)
+		if run_path:
+			os.chdir(cwd)
 
-	def exec_output(self, args, string=False):
+	def exec_output(self, args, string=False, run_path=None):
+		cwd = None
+		if run_path:
+			cwd = os.getcwd()
+			os.chdir(run_path)
 		result = subprocess.check_output(["lxc", "exec", self.container_name, "--"] + args)
+		if run_path:
+			os.chdir(cwd)
 		return result.decode("utf-8") if string else result
 
-	def exec_input(self, input_contents, args, string=False):
+	def exec_input(self, input_contents, args, string=False, run_path=None):
+		cwd = None
+		if run_path:
+			cwd = os.getcwd()
+			os.chdir(run_path)
 		p = subprocess.Popen(["lxc", "exec", self.container_name, "--"] + args, stdin=subprocess.PIPE)
 		p.communicate(input=bytes(input_contents, "utf-8") if string else input_contents)
+		if run_path:
+			os.chdir(cwd)
 
-	def exec_io(self, input_contents, args, instring=False, outstring=False):
+	def exec_io(self, input_contents, args, instring=False, outstring=False, run_path=None):
+		cwd = None
+		if run_path:
+			cwd = os.getcwd()
+			os.chdir(run_path)
 		p = subprocess.Popen(["lxc", "exec", self.container_name, "--"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 		p.stdin.write(bytes(input_contents, "utf-8") if instring else input_contents)
 		p.stdin.close()
 		result = p.stdout.read()
+		if run_path:
+			os.chdir(cwd)
 		return result.decode("utf-8") if outstring else result
 
-	def exec_script(self, script_contents):
+	def exec_script_at(self, script_path, interpreter="bash", run_path=None, args=None):
+		command = [interpreter, script_path]
+		if args:
+			command = command + ["--"] + args
+		self.exec(command, run_path=run_path)
+
+	def exec_script_contents(self, script_contents, interpreter="bash", run_path=None, args=None):
 		path = self.generate_temp_filename() + ".sh"
-		self.write(path, script_contents, string=True)
-		self.exec(["bash", path])
+		self.write_to_file(path, script_contents, string=True)
+		self.exec_script_at(path, interpreter=interpreter, run_path=run_path, args=args)
 		self.rm(path)
 
 	def is_network_up(self):
@@ -187,6 +220,16 @@ class LinuxGuest:
 	def rm(self, path):
 		self.exec(["rm", "-rf", path])
 
+	def chmod(self, path, mode):
+		self.exec(["chmod", mode, path])
+
+	def git_clone(self, url, guest_path, branch=None):
+		args = ["--recursive", "--shallow-submodules", "--single-branch", "--no-tags", "--depth", "1"]
+		if branch:
+			args.append("--branch")
+			args.append(branch)
+		self.exec(["git", "clone"] + args + [url, guest_path])
+
 	def copy_host_fs_to_guest(self, host_path, guest_path):
 		# tar cf - . | lxc exec $container_name -- tar xf - --no-same-owner -C "$dstdir"
 		self.exec(["mkdir", "-p", guest_path])
@@ -202,7 +245,7 @@ class LinuxGuest:
 
 	def download_url(self, url, filename_suffix=""):
 		guest_path = self.generate_temp_filename() + filename_suffix
-		self.write(guest_path, self.read_from_url(url))
+		self.write_to_file(guest_path, self.read_from_url(url))
 		return guest_path
 
 	def untar_url(self, url, guest_path):
@@ -233,20 +276,6 @@ class LinuxGuest:
 		self.add_basic_user(name, "/home/"+name)
 		self.add_user_to_groups(name, ["adm", "sudo"])
 
-	def set_locale(self, language=DEFAULT_LANGUAGE, region=DEFAULT_REGION, kb_layout=DEFAULT_KEYBOARD_LAYOUT, kb_model=DEFAULT_KEYBOARD_MODEL):
-		# Example: "en", "US", "us", "pc105"
-		lang_base=language+"_"+region
-		lang_full=lang_base+".UTF-8"
-		self.exec_input("keyboard-configuration keyboard-configuration/layoutcode string {}\n"
-			"keyboard-configuration keyboard-configuration/modelcode string {}"
-			.format(kb_layout, kb_model), ["debconf-set-selections"], string=True)
-		self.exec(["locale-gen", lang_base, lang_full])
-		self.exec(["update-locale", "LANG="+lang_full, "LANGUAGE="+lang_base+":"+language, "LC_ALL="+lang_full])
-
-	def set_timezone(self, timezone):
-		# Example: "America/Vancouver"
-		self.exec(["timedatectl", "set-timezone", timezone])
-
 	def setup_id_map(self, guest_user, guest_group, host_user, host_group):
 		uid_gid_map = "uid {} {}\ngid {} {}".format(host_user, guest_user, host_group, guest_group)
 		self.config_set("raw.idmap", uid_gid_map)
@@ -266,10 +295,62 @@ class LinuxGuest:
 
 # -----------------------------------------------------------------------------
 
+class AlpineGuest(LinuxGuest):
+
+	def __init__(self, image_name, container_name, admin_user):
+		super().__init__(image_name, container_name, admin_user)
+
+	def set_locale(self, language=DEFAULT_LANGUAGE, region=DEFAULT_REGION, kb_layout=DEFAULT_KEYBOARD_LAYOUT, kb_model=DEFAULT_KEYBOARD_MODEL):
+		# Example: "en", "US", "us", "pc105"
+		print("TODO: AlpineGuest::set_locale")
+
+	def set_timezone(self, timezone):
+		# Example: "America/Vancouver"
+		self.apk_install(["tzdata"])
+		self.exec(["ln" "-s" "/usr/share/zoneinfo/" + timezone, "/etc/localtime"])
+		self.write_to_file("/etc/timezone", timezone, string=True)
+
+	def apk(self, command):
+		self.exec(["apk"] + command)
+
+	def apk_add_repositories(self, repositories):
+		contents = ""
+		for repo in repositories:
+			contents = contents + repo + "\n"
+		self.write_to_file("/etc/apk/repositories", contents, string=True, append=True)
+
+	def apk_install(self, packages):
+		self.apk(["add"] + packages)
+
+	def apk_remove(self, packages):
+		self.apk(["del"] + packages)
+
+	def activate_services(self, services):
+		for service in services:
+			self.exec(["rc-update", "add", service])
+			self.exec(["rc-service", service, "start"])
+
+
+# -----------------------------------------------------------------------------
+
 class DebianGuest(LinuxGuest):
 
 	def __init__(self, image_name, container_name, admin_user):
 		super().__init__(image_name, container_name, admin_user)
+
+	def set_locale(self, language=DEFAULT_LANGUAGE, region=DEFAULT_REGION, kb_layout=DEFAULT_KEYBOARD_LAYOUT, kb_model=DEFAULT_KEYBOARD_MODEL):
+		# Example: "en", "US", "us", "pc105"
+		lang_base=language+"_"+region
+		lang_full=lang_base+".UTF-8"
+		self.exec_input("keyboard-configuration keyboard-configuration/layoutcode string {}\n"
+			"keyboard-configuration keyboard-configuration/modelcode string {}"
+			.format(kb_layout, kb_model), ["debconf-set-selections"], string=True)
+		self.exec(["locale-gen", lang_base, lang_full])
+		self.exec(["update-locale", "LANG="+lang_full, "LANGUAGE="+lang_base+":"+language, "LC_ALL="+lang_full])
+
+	def set_timezone(self, timezone):
+		# Example: "America/Vancouver"
+		self.exec(["timedatectl", "set-timezone", timezone])
 
 	def apt(self, command):
 		self.exec(["bash", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get " + command])
@@ -300,7 +381,7 @@ class DebianGuest(LinuxGuest):
 
 	def apt_add_signed_repository(self, name, key_location, repo_location, repo_type):
 		self.install_gpg_key(key_location, "/usr/share/keyrings/" + name + "-archive-keyring.gpg")
-		self.write("/etc/apt/sources.list.d/" + name + ".list",
+		self.write_to_file("/etc/apt/sources.list.d/" + name + ".list",
 			"deb [signed-by=/usr/share/keyrings/" + name + "-archive-keyring.gpg] " + repo_location + " " + repo_type,
 			string=True)
 		self.apt_update()
@@ -315,7 +396,7 @@ class DebianGuest(LinuxGuest):
 	def install_gpg_key(self, key_location, dest_file):
 		key = self.read_from_url(key_location)
 		key = self.exec_io(key, ["gpg","--dearmor"])
-		self.write(dest_file, key)
+		self.write_to_file(dest_file, key)
 
 	def snap_install(self, packages):
 		for package in packages:
@@ -376,7 +457,7 @@ class DebianGuest(LinuxGuest):
 	def install_golang(self):
 		# https://go.dev/doc/install
 		self.untar_url("https://go.dev/dl/go" + VERSION_GOLANG + ".linux-amd64.tar.gz", "/usr/local")
-		self.write("/etc/profile.d/golang.sh", "export PATH=$PATH:/usr/local/go/bin\n", string=True)
+		self.write_to_file("/etc/profile.d/golang.sh", "export PATH=$PATH:/usr/local/go/bin\n", string=True)
 
 	def install_rust(self):
 		# https://forge.rust-lang.org/infra/other-installation-methods.html#standalone-installers
@@ -639,6 +720,23 @@ class UbuntuLauncher(DebianLauncher):
 		self.guest.apt_remove(["cloud-init"])
 		self.guest.apt_autoremove()
 
+# -----------------------------------------------------------------------------
+
+class AlpineLauncher(LinuxLauncher):
+
+	def __init__(self, image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user):
+		super().__init__(image_name, container_name, mac_addr, bridge, time_zone, admin_user, hostside_user)
+		self.guest = AlpineGuest(image_name, container_name, admin_user)
+
+	def launch_minimal(self, privileged=False, nesting=False):
+		super().launch_minimal(privileged, nesting)
+
+	def launch_basic(self, privileged=False, nesting=False):
+		super().launch_basic(privileged, nesting)
+		self.guest.install_basic()
+		# self.guest.set_locale()
+		# self.guest.set_timezone(self.time_zone)
+
 
 # =============================================================================
 
@@ -865,6 +963,50 @@ class AmuledLauncher(DebianLauncher):
 
 # -----------------------------------------------------------------------------
 
+class KMSLauncher(AlpineLauncher):
+
+	def __init__(self, container_name, mac_addr=None):
+		super().__init__("images:alpine/edge", container_name, mac_addr, DEFAULT_BRIDGE, DEFAULT_TIME_ZONE, None, DEFAULT_HOSTSIDE_USER)
+
+	def launch(self):
+		self.launch_basic()
+
+		build_tools = [
+			"build-base",
+			"gcc",
+			"abuild",
+			"binutils",
+			"cmake",
+			"git",
+		]
+		build_dir = "/tmp/vlmcsd"
+
+		self.guest.apk_install(build_tools)
+		self.guest.git_clone("https://github.com/kstenerud/vlmcsd.git", build_dir)
+		self.guest.exec_script_contents(
+			"""
+set -eux
+cd /tmp/vlmcsd
+make
+mv bin/vlmcs /usr/sbin/
+mv bin/vlmcsd /usr/sbin/
+""", interpreter="sh")
+		self.guest.rm(build_dir)
+		self.guest.apk_remove(build_tools)
+
+		self.guest.write_to_file("/etc/init.d/vlmcsd",
+			"""#!/sbin/openrc-run
+command=/usr/sbin/vlmcsd
+command_args="-d -t 3 -e -p /run/${RC_SVCNAME}.pid"
+pidfile=/run/${RC_SVCNAME}.pid
+depend() {
+    need net
+}
+""", string=True, mode="755")
+		self.guest.activate_services(["vlmcsd"])
+
+# -----------------------------------------------------------------------------
+
 class TestLauncher(DebianLauncher):
 
 	def __init__(self, container_name, mac_addr=None):
@@ -883,6 +1025,7 @@ MACHINES = {
 	'dev':     DevDebianLauncher(     "dev",  "12:4B:53:00:00:21" ),
 	'tx':      BrowserDebianLauncher( "tx",   "12:4B:53:00:00:22" ),
 	'mule':    AmuledLauncher(        "mule", "12:4B:53:00:00:23" ),
+	'kms':     KMSLauncher(           "kms",  "12:4B:53:00:00:15" ),
 	'test':    TestLauncher(          "test", "12:4B:53:00:00:29" ),
 }
 
